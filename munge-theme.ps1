@@ -239,6 +239,90 @@ function Replace-MatchingColors {
 
 #endregion
 
+#region Text parsing (regex-only, preserves entities)
+
+# Matches a Background/Foreground start tag that contains Type="CT_RAW" and a Source="AARRGGBB".
+# We:
+#  - Assert inside-tag presence with lookaheads (order-insensitive)
+#  - Capture:
+#     * group 'pre'  : up to and including Source=" (or '), without touching anything else
+#     * group 'hex'  : the 8 hex digits (AARRGGBB)
+#     * group 'post' : the trailing quote
+# Notes:
+#  - (?is) = ignore case + singleline
+#  - We support both single and double quotes for attributes
+$TagWithRawAndSourcePattern = '(?is)<(?:Background|Foreground)\b(?=[^>]*\bType\s*=\s*["'']CT_RAW["''])(?=[^>]*\bSource\s*=\s*["''][0-9A-Fa-f]{8}["''])[^>]*?\bSource\s*=\s*(?<pre>["''])(?<hex>[0-9A-Fa-f]{8})(?<post>["''])'
+
+function Get-UsedRgbSetFromText {
+    param([string]$XmlText)
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    $regex = [System.Text.RegularExpressions.Regex]::new($TagWithRawAndSourcePattern, 'IgnoreCase, Singleline')
+
+    foreach ($m in $regex.Matches($XmlText)) {
+        $hex = $m.Groups['hex'].Value  # AARRGGBB
+        $rgbKey = $hex.Substring(2,6).ToLowerInvariant()
+        [void]$set.Add($rgbKey)
+    }
+    $set
+}
+function Replace-MatchingSourcesInText {
+    param(
+        [string]$XmlText,
+        [byte[]]$SourceRgb,  # [R,G,B]
+        [byte[]]$TargetRgb,  # [R,G,B]
+        [System.Collections.Generic.HashSet[string]]$UsedRgbSet,
+        [ref]$ReplacedCount
+    )
+
+    $re = [System.Text.RegularExpressions.Regex]::new($TagWithRawAndSourcePattern, 'IgnoreCase, Singleline')
+    $srcKey = ('{0:X2}{1:X2}{2:X2}' -f $SourceRgb[0],$SourceRgb[1],$SourceRgb[2]).ToLowerInvariant()
+
+    $ReplacedCount.Value = 0
+
+    $evaluator = {
+        param([System.Text.RegularExpressions.Match]$m)
+
+        $aarrggbb = $m.Groups['hex'].Value
+        $a = [Convert]::ToByte($aarrggbb.Substring(0,2),16)
+        $r = [Convert]::ToByte($aarrggbb.Substring(2,2),16)
+        $g = [Convert]::ToByte($aarrggbb.Substring(4,2),16)
+        $b = [Convert]::ToByte($aarrggbb.Substring(6,2),16)
+
+        $rgbKeyHere = ('{0:X2}{1:X2}{2:X2}' -f $r,$g,$b).ToLowerInvariant()
+
+        if ($rgbKeyHere -ne $srcKey) {
+            # not a match -> leave exactly as-is
+            return $m.Value
+        }
+
+        # compute closest unused to TargetRgb
+        $best = Find-ClosestUnusedColor -TR $TargetRgb[0] -TG $TargetRgb[1] -TB $TargetRgb[2] -UsedRgbSet $UsedRgbSet
+        $newR=[byte]$best[0]; $newG=[byte]$best[1]; $newB=[byte]$best[2]
+
+        # update used set immediately to avoid duplicates later in the same pass
+        $newKey = ('{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB).ToLowerInvariant()
+        [void]$UsedRgbSet.Add($newKey)
+
+        $newHex = Join-ArgbHex8 -A $a -R $newR -G $newG -B $newB
+
+        $script:__replcount = $script:__replcount + 1
+
+        # Reconstruct ONLY the Source value, preserving quotes and everything else
+        $pre = $m.Groups['pre'].Value
+        $post = $m.Groups['post'].Value
+        # Replace the captured hex inside Source="<hex>"
+        return ($m.Value.Remove($m.Groups['hex'].Index - $m.Index, $m.Groups['hex'].Length).Insert($m.Groups['hex'].Index - $m.Index, $newHex))
+    }
+
+    $script:__replcount = 0
+    $newText = $re.Replace($XmlText, [System.Text.RegularExpressions.MatchEvaluator]$evaluator)
+    $ReplacedCount.Value = $script:__replcount
+    $newText
+}
+#endregion
+
+
 #region Main
 
 try {
@@ -249,16 +333,21 @@ try {
     $srcRgb = Get-RgbBytesFromHash $SourceColor
     $tgtRgb = Get-RgbBytesFromHash $TargetColor
 
-    [xml]$xml = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
+#    [xml]$xml = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
+    $text = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
 
     # Collect relevant elements
-    $elements = [System.Collections.ArrayList](Get-ThemeElements -XmlDoc $xml)
+#    $elements = [System.Collections.ArrayList](Get-ThemeElements -XmlDoc $xml)
 
     # Build initial used set from CT_RAW nodes (original colors only)
-    $used = Build-UsedColorSet -Elements $elements
+#    $used = Build-UsedColorSet -Elements $elements
+    $used = Get-UsedRgbSetFromText -XmlText $text
 
     # Replace matching colors; as we replace, add the new RGBs to the used set to ensure uniqueness
-    $count = Replace-MatchingColors -Elements $elements -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used
+    $countRef = 0
+    $updated = Replace-MatchingSourcesInText -XmlText $text -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used -ReplacedCount ([ref]$countRef)
+
+#    $count = Replace-MatchingColors -Elements $elements -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used
 
     # Ensure output directory exists
     $outDir = Split-Path -Path $OutputFile -Parent
@@ -266,9 +355,12 @@ try {
         New-Item -ItemType Directory -Path $outDir | Out-Null
     }
 
-    $xml.Save($OutputFile)
+#    $xml.Save($OutputFile)
+    # Write back, preserving encoding if possible (default is UTF8 without BOM; adjust if you need BOM)
+#    $outPath = Ensure-ParentDirectory -FilePath $OutputFile
+    Set-Content -LiteralPath $OutputFile -Value $updated -Encoding UTF8
 
-    Write-Host ("Done. Replaced {0} occurrence(s) of {1} with colors based on {2}. Output: {3}" -f $count,$SourceColor,$TargetColor,$OutputFile)
+    Write-Host ("Done. Replaced {0} occurrence(s) of {1} with colors based on {2}. Output: {3}" -f $countRef,$SourceColor,$TargetColor,$OutputFile)
 }
 catch {
     Write-Error $_.Exception.Message
