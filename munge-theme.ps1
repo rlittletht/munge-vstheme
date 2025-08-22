@@ -21,6 +21,9 @@
 .PARAMETER TargetColor
   Desired color basis, in form "#RRGGBB". If this exact RGB is already used, the script finds the closest unused RGB.
 
+.PARAMETER LogFile
+ File to record changes into
+
 .EXAMPLE
   .\Replace-VsThemeColor.ps1 -InputFile .\MyTheme.vstheme -OutputFile .\MyTheme-Updated.vstheme -SourceColor "#31FF00" -TargetColor "#30EE10"
 #>
@@ -37,7 +40,10 @@ param(
     [string]$SourceColor,
 
     [Parameter(Mandatory=$true)]
-    [string]$TargetColor
+    [string]$TargetColor,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$LogFile        # path to append change logs
 )
 
 #region Utility: Parsing & Validation
@@ -78,6 +84,17 @@ function Split-ArgbHex8 {
 function Join-ArgbHex8 {
     param([byte]$A,[byte]$R,[byte]$G,[byte]$B)
     return ('{0:X2}{1:X2}{2:X2}{3:X2}' -f $A,$R,$G,$B)
+}
+
+function Ensure-ParentDirectory {
+    param([string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($FilePath)) { throw "Path cannot be empty." }
+    $full = [System.IO.Path]::GetFullPath($FilePath)
+    $parent = [System.IO.Path]::GetDirectoryName($full)
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $full
 }
 
 #endregion
@@ -241,17 +258,18 @@ function Replace-MatchingColors {
 
 #region Text parsing (regex-only, preserves entities)
 
-# Matches a Background/Foreground start tag that contains Type="CT_RAW" and a Source="AARRGGBB".
-# We:
-#  - Assert inside-tag presence with lookaheads (order-insensitive)
-#  - Capture:
-#     * group 'pre'  : up to and including Source=" (or '), without touching anything else
-#     * group 'hex'  : the 8 hex digits (AARRGGBB)
-#     * group 'post' : the trailing quote
+# Pattern:
+#  - Matches <Background> or <Foreground> start tag
+#  - Asserts it contains Type="CT_RAW" AND Source="AARRGGBB"
+#  - Captures:
+#     * tag  : Background|Foreground
+#     * pre  : opening quote of Source
+#     * hex  : 8 hex digits (AARRGGBB)
+#     * post : closing quote
 # Notes:
-#  - (?is) = ignore case + singleline
-#  - We support both single and double quotes for attributes
-$TagWithRawAndSourcePattern = '(?is)<(?:Background|Foreground)\b(?=[^>]*\bType\s*=\s*["'']CT_RAW["''])(?=[^>]*\bSource\s*=\s*["''][0-9A-Fa-f]{8}["''])[^>]*?\bSource\s*=\s*(?<pre>["''])(?<hex>[0-9A-Fa-f]{8})(?<post>["''])'
+#  - order-insensitive for attributes
+#  - supports single or double quotes
+$TagWithRawAndSourcePattern = '(?is)<(?<tag>Background|Foreground)\b(?=[^>]*\bType\s*=\s*["'']CT_RAW["''])(?=[^>]*\bSource\s*=\s*["''][0-9A-Fa-f]{8}["''])[^>]*?\bSource\s*=\s*(?<pre>["''])(?<hex>[0-9A-Fa-f]{8})(?<post>["''])'
 
 function Get-UsedRgbSetFromText {
     param([string]$XmlText)
@@ -266,19 +284,33 @@ function Get-UsedRgbSetFromText {
     }
     $set
 }
+
+function Get-UiElementNameFromTagText {
+    param([string]$TagText)
+    # Try to extract Name="..." if present in the same start tag
+    $nameMatch = [regex]::Match($TagText, '(?is)\bName\s*=\s*(["''])(?<n>.*?)\1')
+    if ($nameMatch.Success) { return $nameMatch.Groups['n'].Value }
+    # Some themes use attributes like Key="..." or ResourceKey="..."
+    $keyMatch = [regex]::Match($TagText, '(?is)\b(?:Key|ResourceKey)\s*=\s*(["''])(?<k>.*?)\1')
+    if ($keyMatch.Success) { return $keyMatch.Groups['k'].Value }
+    return '(unnamed)'
+}
+
 function Replace-MatchingSourcesInText {
     param(
         [string]$XmlText,
         [byte[]]$SourceRgb,  # [R,G,B]
         [byte[]]$TargetRgb,  # [R,G,B]
         [System.Collections.Generic.HashSet[string]]$UsedRgbSet,
-        [ref]$ReplacedCount
+        [ref]$ReplacedCount,
+        [System.Collections.Generic.List[string]]$LogBuffer
     )
 
     $re = [System.Text.RegularExpressions.Regex]::new($TagWithRawAndSourcePattern, 'IgnoreCase, Singleline')
     $srcKey = ('{0:X2}{1:X2}{2:X2}' -f $SourceRgb[0],$SourceRgb[1],$SourceRgb[2]).ToLowerInvariant()
 
     $ReplacedCount.Value = 0
+    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
     $evaluator = {
         param([System.Text.RegularExpressions.Match]$m)
@@ -302,16 +334,22 @@ function Replace-MatchingSourcesInText {
 
         # update used set immediately to avoid duplicates later in the same pass
         $newKey = ('{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB).ToLowerInvariant()
-        [void]$UsedRgbSet.Add($newKey)
+        $UsedRgbSet.Add($newKey)
 
         $newHex = Join-ArgbHex8 -A $a -R $newR -G $newG -B $newB
+
+        # Logging
+        $tagName = $m.Groups['tag'].Value         # Background or Foreground
+        $uiName  = Get-UiElementNameFromTagText -TagText $m.Value
+        $origRgbHash = ('#{0:X2}{1:X2}{2:X2}' -f $r,$g,$b)
+        $newRgbHash  = ('#{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB)
+        $logLine = "{0} | {1} | {2} | Original={3} ({4}) -> New={5} ({6})" -f `
+            $timestamp, $tagName, $uiName, $aarrggbb.ToUpper(), $origRgbHash, $newHex.ToUpper(), $newRgbHash
+        $LogBuffer.Add($logLine) | Out-Null
 
         $script:__replcount = $script:__replcount + 1
 
         # Reconstruct ONLY the Source value, preserving quotes and everything else
-        $pre = $m.Groups['pre'].Value
-        $post = $m.Groups['post'].Value
-        # Replace the captured hex inside Source="<hex>"
         return ($m.Value.Remove($m.Groups['hex'].Index - $m.Index, $m.Groups['hex'].Length).Insert($m.Groups['hex'].Index - $m.Index, $newHex))
     }
 
@@ -320,8 +358,8 @@ function Replace-MatchingSourcesInText {
     $ReplacedCount.Value = $script:__replcount
     $newText
 }
-#endregion
 
+#endregion
 
 #region Main
 
@@ -345,20 +383,25 @@ try {
 
     # Replace matching colors; as we replace, add the new RGBs to the used set to ensure uniqueness
     $countRef = 0
-    $updated = Replace-MatchingSourcesInText -XmlText $text -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used -ReplacedCount ([ref]$countRef)
+    $logBuffer = New-Object System.Collections.Generic.List[string]
+
+    $updated = Replace-MatchingSourcesInText -XmlText $text -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used -ReplacedCount ([ref]$countRef) -LogBuffer $logBuffer
 
 #    $count = Replace-MatchingColors -Elements $elements -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used
 
-    # Ensure output directory exists
-    $outDir = Split-Path -Path $OutputFile -Parent
-    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
-        New-Item -ItemType Directory -Path $outDir | Out-Null
-    }
+    $outPath = Ensure-ParentDirectory -FilePath $OutputFile
 
 #    $xml.Save($OutputFile)
     # Write back, preserving encoding if possible (default is UTF8 without BOM; adjust if you need BOM)
 #    $outPath = Ensure-ParentDirectory -FilePath $OutputFile
-    Set-Content -LiteralPath $OutputFile -Value $updated -Encoding UTF8
+    Set-Content -LiteralPath $outPath -Value $updated -Encoding UTF8
+
+    # Write / append logs
+    $logPath = Ensure-ParentDirectory -FilePath $LogFile
+    if ($logBuffer.Count -gt 0) {
+        # append lines (create file if it doesn't exist)
+        Add-Content -LiteralPath $logPath -Value $logBuffer -Encoding UTF8
+    }
 
     Write-Host ("Done. Replaced {0} occurrence(s) of {1} with colors based on {2}. Output: {3}" -f $countRef,$SourceColor,$TargetColor,$OutputFile)
 }
