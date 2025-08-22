@@ -49,18 +49,20 @@ param(
 #region Utility: Parsing & Validation
 
 function Test-HexRgb {
-    param([string]$HashRgb)
-    return ($HashRgb -match '^[0-9A-Fa-f]{6}$')
+    param([string]$Rgb)
+    # Accept with or without leading '#'
+    return ($Rgb -match '^#?[0-9A-Fa-f]{6}$')
 }
 
 function Get-RgbBytesFromHash {
-    param([string]$HashRgb) # "RRGGBB"
-    if (-not (Test-HexRgb $HashRgb)) {
-        throw "Invalid RGB color '$HashRgb'. Expected format: #RRGGBB"
+    param([string]$Rgb) # "#RRGGBB" or "RRGGBB"
+    if (-not (Test-HexRgb $Rgb)) {
+        throw "Invalid RGB color '$Rgb'. Expected format: #RRGGBB (leading '#' optional)."
     }
-    $rr = [Convert]::ToByte($HashRgb.Substring(0,2),16)
-    $gg = [Convert]::ToByte($HashRgb.Substring(2,2),16)
-    $bb = [Convert]::ToByte($HashRgb.Substring(4,2),16)
+    if ($Rgb.StartsWith('#')) { $Rgb = $Rgb.Substring(1) }
+    $rr = [Convert]::ToByte($Rgb.Substring(0,2),16)
+    $gg = [Convert]::ToByte($Rgb.Substring(2,2),16)
+    $bb = [Convert]::ToByte($Rgb.Substring(4,2),16)
     [byte[]]@($rr,$gg,$bb)
 }
 
@@ -285,14 +287,69 @@ function Get-UsedRgbSetFromText {
     $set
 }
 
-function Get-UiElementNameFromTagText {
-    param([string]$TagText)
-    # Try to extract Name="..." if present in the same start tag
-    $nameMatch = [regex]::Match($TagText, '(?is)\bName\s*=\s*(["''])(?<n>.*?)\1')
-    if ($nameMatch.Success) { return $nameMatch.Groups['n'].Value }
-    # Some themes use attributes like Key="..." or ResourceKey="..."
-    $keyMatch = [regex]::Match($TagText, '(?is)\b(?:Key|ResourceKey)\s*=\s*(["''])(?<k>.*?)\1')
-    if ($keyMatch.Success) { return $keyMatch.Groups['k'].Value }
+function Get-CategorySpansFromText {
+    param([string]$XmlText)
+
+    # Match each <Category ...>...</Category> block (non-greedy)
+    $re = [System.Text.RegularExpressions.Regex]::new('(?is)<Category\b(?<attrs>[^>]*)>(?<content>.*?)</Category>')
+    $spans = New-Object System.Collections.Generic.List[object]
+
+    foreach ($m in $re.Matches($XmlText)) {
+        $attrs = $m.Groups['attrs'].Value
+        $name = '(uncategorized)'
+        $nm = [regex]::Match($attrs, '(?is)\bName\s*=\s*(["''])(?<n>.*?)\1')
+        if ($nm.Success) { $name = $nm.Groups['n'].Value }
+
+        $spans.Add([pscustomobject]@{
+            Start = $m.Index
+            End   = $m.Index + $m.Length  # exclusive
+            Name  = $name
+        }) | Out-Null
+    }
+    $spans
+}
+
+function Get-CategoryNameByIndex {
+    param(
+        [int]$Index,
+        [System.Collections.Generic.List[object]]$CategorySpans
+    )
+    foreach ($s in $CategorySpans) {
+        if ($Index -ge $s.Start -and $Index -lt $s.End) { return $s.Name }
+    }
+    return '(uncategorized)'
+}
+
+function Get-ColorSpansFromText {
+    param([string]$XmlText)
+
+    # Match each <Color ...>...</Color> block (non-greedy), regardless of attribute order
+    $re = [System.Text.RegularExpressions.Regex]::new('(?is)<Color\b(?<attrs>[^>]*)>(?<content>.*?)</Color>')
+    $spans = New-Object System.Collections.Generic.List[object]
+
+    foreach ($m in $re.Matches($XmlText)) {
+        $attrs = $m.Groups['attrs'].Value
+        $name = '(unnamed)'
+        $nm = [regex]::Match($attrs, '(?is)\bName\s*=\s*(["''])(?<n>.*?)\1')
+        if ($nm.Success) { $name = $nm.Groups['n'].Value }
+
+        $spans.Add([pscustomobject]@{
+            Start = $m.Index
+            End   = $m.Index + $m.Length  # exclusive
+            Name  = $name
+        }) | Out-Null
+    }
+    $spans
+}
+
+function Get-UiElementNameByIndex {
+    param(
+        [int]$Index,
+        [System.Collections.Generic.List[object]]$ColorSpans
+    )
+    foreach ($s in $ColorSpans) {
+        if ($Index -ge $s.Start -and $Index -lt $s.End) { return $s.Name }
+    }
     return '(unnamed)'
 }
 
@@ -303,16 +360,26 @@ function Replace-MatchingSourcesInText {
         [byte[]]$TargetRgb,  # [R,G,B]
         [System.Collections.Generic.HashSet[string]]$UsedRgbSet,
         [ref]$ReplacedCount,
-        [System.Collections.Generic.List[string]]$LogBuffer
+        [System.Collections.Generic.List[string]]$LogBuffer,
+        [System.Collections.Generic.List[object]]$ColorSpans,
+        [System.Collections.Generic.List[object]]$CategorySpans
+
     )
 
     $re = [System.Text.RegularExpressions.Regex]::new($TagWithRawAndSourcePattern, 'IgnoreCase, Singleline')
-    $srcKey = ('{0:X2}{1:X2}{2:X2}' -f $SourceRgb[0],$SourceRgb[1],$SourceRgb[2]).ToLowerInvariant()
 
-    $ReplacedCount.Value = 0
-    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    # Capture needed values locally for the delegate (no $using:)
+    $srcKey  = ('{0:X2}{1:X2}{2:X2}' -f $SourceRgb[0],$SourceRgb[1],$SourceRgb[2]).ToLowerInvariant()
+    $tR      = [byte]$TargetRgb[0]
+    $tG      = [byte]$TargetRgb[1]
+    $tB      = [byte]$TargetRgb[2]
+    $usedSet = $UsedRgbSet
+    $logBuf  = $LogBuffer
+    $spans   = $ColorSpans
+    $catSpans = $CategorySpans
+    $stamp   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
-    $evaluator = {
+    $evaluator = [System.Text.RegularExpressions.MatchEvaluator]{
         param([System.Text.RegularExpressions.Match]$m)
 
         $aarrggbb = $m.Groups['hex'].Value
@@ -322,42 +389,42 @@ function Replace-MatchingSourcesInText {
         $b = [Convert]::ToByte($aarrggbb.Substring(6,2),16)
 
         $rgbKeyHere = ('{0:X2}{1:X2}{2:X2}' -f $r,$g,$b).ToLowerInvariant()
-
         if ($rgbKeyHere -ne $srcKey) {
-            # not a match -> leave exactly as-is
             return $m.Value
         }
 
-        # compute closest unused to TargetRgb
-        $best = Find-ClosestUnusedColor -TR $TargetRgb[0] -TG $TargetRgb[1] -TB $TargetRgb[2] -UsedRgbSet $UsedRgbSet
+        # Choose closest unused to target, then reserve it
+        $best = Find-ClosestUnusedColor -TR $tR -TG $tG -TB $tB -UsedRgbSet $usedSet
         $newR=[byte]$best[0]; $newG=[byte]$best[1]; $newB=[byte]$best[2]
-
-        # update used set immediately to avoid duplicates later in the same pass
         $newKey = ('{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB).ToLowerInvariant()
-        $UsedRgbSet.Add($newKey)
+        [void]$usedSet.Add($newKey)
 
         $newHex = Join-ArgbHex8 -A $a -R $newR -G $newG -B $newB
 
-        # Logging
-        $tagName = $m.Groups['tag'].Value         # Background or Foreground
-        $uiName  = Get-UiElementNameFromTagText -TagText $m.Value
+        # Look up parent <Color Name="..."> by this match's original offset
+        $uiName  = Get-UiElementNameByIndex -Index $m.Index -ColorSpans $spans
+        $catName  = Get-CategoryNameByIndex -Index $m.Index -CategorySpans $catSpans
+        $tagName = $m.Groups['tag'].Value  # Background/Foreground
+
+        # Log
         $origRgbHash = ('#{0:X2}{1:X2}{2:X2}' -f $r,$g,$b)
         $newRgbHash  = ('#{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB)
-        $logLine = "{0} | {1} | {2} | Original={3} ({4}) -> New={5} ({6})" -f `
-            $timestamp, $tagName, $uiName, $aarrggbb.ToUpper(), $origRgbHash, $newHex.ToUpper(), $newRgbHash
-        $LogBuffer.Add($logLine) | Out-Null
+        $logLine = "{0} | {1} | Category={2} | {3} | Original={4} ({5}) -> New={6} ({7})" -f `
+            $stamp, $tagName, $catName, $uiName, $aarrggbb.ToUpper(), $origRgbHash, $newHex.ToUpper(), $newRgbHash
+        $logBuf.Add($logLine) | Out-Null
 
         $script:__replcount = $script:__replcount + 1
 
-        # Reconstruct ONLY the Source value, preserving quotes and everything else
+        # Replace only the 8 hex digits inside Source="AARRGGBB"
         return ($m.Value.Remove($m.Groups['hex'].Index - $m.Index, $m.Groups['hex'].Length).Insert($m.Groups['hex'].Index - $m.Index, $newHex))
     }
 
     $script:__replcount = 0
-    $newText = $re.Replace($XmlText, [System.Text.RegularExpressions.MatchEvaluator]$evaluator)
+    $newText = $re.Replace($XmlText, $evaluator)
     $ReplacedCount.Value = $script:__replcount
-    $newText
+    return $newText
 }
+
 
 #endregion
 
@@ -373,6 +440,8 @@ try {
 
 #    [xml]$xml = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
     $text = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
+    $colorSpans = Get-ColorSpansFromText -XmlText $text
+    $categorySpans = Get-CategorySpansFromText -XmlText $text
 
     # Collect relevant elements
 #    $elements = [System.Collections.ArrayList](Get-ThemeElements -XmlDoc $xml)
@@ -385,7 +454,15 @@ try {
     $countRef = 0
     $logBuffer = New-Object System.Collections.Generic.List[string]
 
-    $updated = Replace-MatchingSourcesInText -XmlText $text -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used -ReplacedCount ([ref]$countRef) -LogBuffer $logBuffer
+    $updated = Replace-MatchingSourcesInText `
+        -XmlText $text `
+        -SourceRgb $srcRgb `
+        -TargetRgb $tgtRgb `
+        -UsedRgbSet $used `
+        -ReplacedCount ([ref]$countRef) `
+        -LogBuffer $logBuffer `
+        -ColorSpans $colorSpans `
+        -CategorySpans $categorySpans
 
 #    $count = Replace-MatchingColors -Elements $elements -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used
 
