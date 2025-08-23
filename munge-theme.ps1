@@ -39,8 +39,8 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$SourceColor,
 
-    [Parameter(Mandatory=$true)]
-    [string]$TargetColor,
+    [Parameter(Mandatory=$false)]
+    [string]$TargetColor = $null,
     
     [Parameter(Mandatory=$true)]
     [string]$LogFile        # path to append change logs
@@ -97,6 +97,22 @@ function Ensure-ParentDirectory {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
     $full
+}
+
+function Get-FullPathStrict {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ParamName
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "$ParamName cannot be empty."
+    }
+    # Must start with drive-root (C:\...) or UNC (\\server\share\...)
+    $isFullyQualified = $Path -match '^(?:[A-Za-z]:\\|\\\\)'
+    if (-not $isFullyQualified) {
+        throw "$ParamName must be a fully qualified path (e.g., C:\folder\file.ext or \\server\share\file.ext)."
+    }
+    return [System.IO.Path]::GetFullPath($Path)
 }
 
 #endregion
@@ -178,85 +194,6 @@ function Find-ClosestUnusedColor {
 
 #endregion
 
-#region XML scanning & transformation
-
-function Get-ThemeElements {
-    param([xml]$XmlDoc)
-    # Return all <Background> and <Foreground> nodes anywhere in the document
-    # Using SelectNodes with XPath that matches both names.
-    $nsMgr = New-Object System.Xml.XmlNamespaceManager($XmlDoc.NameTable)
-    # .vstheme files typically have no namespace for these nodes; if they do,
-    # this naive approach may need enhancement. For the common case, the below works:
-    $bg = $XmlDoc.SelectNodes('//Background')
-    $fg = $XmlDoc.SelectNodes('//Foreground')
-    @($bg + $fg)
-}
-
-function Build-UsedColorSet {
-    param([System.Collections.ArrayList]$Elements)
-    $set = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($el in $Elements) {
-        $type = $el.GetAttribute('Type')
-        if ($type -ne 'CT_RAW') { continue }
-        $src = $el.GetAttribute('Source')
-        if ([string]::IsNullOrWhiteSpace($src)) { continue }
-        try {
-            $argb = Split-ArgbHex8 $src
-        } catch { continue } # skip malformed
-        $rgbKey = ('{0:X2}{1:X2}{2:X2}' -f $argb[1],$argb[2],$argb[3]).ToLowerInvariant()
-        [void]$set.Add($rgbKey)
-    }
-    return $set
-}
-
-function Replace-MatchingColors {
-    param(
-        [System.Collections.ArrayList]$Elements,
-        [byte[]]$SourceRgb,   # [R,G,B]
-        [byte[]]$TargetRgb,   # [R,G,B]
-        [System.Collections.Generic.HashSet[string]]$UsedRgbSet
-    )
-
-    $replacedCount = 0
-
-    foreach ($el in $Elements) {
-        $type = $el.GetAttribute('Type')
-        if ($type -ne 'CT_RAW') { continue }
-
-        $src = $el.GetAttribute('Source')
-        if ([string]::IsNullOrWhiteSpace($src)) { continue }
-
-        try {
-            $argb = Split-ArgbHex8 $src
-        } catch { continue }
-
-        $a = $argb[0]; $r = $argb[1]; $g = $argb[2]; $b = $argb[3]
-
-        # Compare RGB against SourceColor
-        if ($r -eq $SourceRgb[0] -and $g -eq $SourceRgb[1] -and $b -eq $SourceRgb[2]) {
-            # Pick closest unused to TargetRgb
-            $bestRgb = Find-ClosestUnusedColor -TR $TargetRgb[0] -TG $TargetRgb[1] -TB $TargetRgb[2] -UsedRgbSet $UsedRgbSet
-            $newR = [byte]$bestRgb[0]; $newG = [byte]$bestRgb[1]; $newB = [byte]$bestRgb[2]
-
-            $newArgb = Join-ArgbHex8 -A $a -R $newR -G $newG -B $newB
-            $el.SetAttribute('Source', $newArgb)
-
-            # Track newly used color to prevent duplicates in subsequent replacements
-            $key = ('{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB).ToLowerInvariant()
-            [void]$UsedRgbSet.Add($key)
-
-            $replacedCount++
-        }
-        else {
-            # No replacement; leave as is
-            continue
-        }
-    }
-
-    return $replacedCount
-}
-
-#endregion
 
 #region Text parsing (regex-only, preserves entities)
 
@@ -377,8 +314,7 @@ function Replace-MatchingSourcesInText {
     $logBuf  = $LogBuffer
     $spans   = $ColorSpans
     $catSpans = $CategorySpans
-    $stamp   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-
+    
     $evaluator = [System.Text.RegularExpressions.MatchEvaluator]{
         param([System.Text.RegularExpressions.Match]$m)
 
@@ -406,11 +342,10 @@ function Replace-MatchingSourcesInText {
         $catName  = Get-CategoryNameByIndex -Index $m.Index -CategorySpans $catSpans
         $tagName = $m.Groups['tag'].Value  # Background/Foreground
 
-        # Log
+        # Log line: category,ui name,original color,new color
         $origRgbHash = ('#{0:X2}{1:X2}{2:X2}' -f $r,$g,$b)
         $newRgbHash  = ('#{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB)
-        $logLine = "{0} | {1} | Category={2} | {3} | Original={4} ({5}) -> New={6} ({7})" -f `
-            $stamp, $tagName, $catName, $uiName, $aarrggbb.ToUpper(), $origRgbHash, $newHex.ToUpper(), $newRgbHash
+        $logLine = "{0},{1},{2},{3}" -f $catName, $uiName, $origRgbHash, $newRgbHash
         $logBuf.Add($logLine) | Out-Null
 
         $script:__replcount = $script:__replcount + 1
@@ -434,6 +369,14 @@ try {
     if (-not (Test-Path -LiteralPath $InputFile)) {
         throw "Input file not found: $InputFile"
     }
+
+    # If -TargetColor wasn’t provided (or is empty), use -SourceColor
+    if (-not $PSBoundParameters.ContainsKey('TargetColor') -or [string]::IsNullOrWhiteSpace($TargetColor)) {
+        $TargetColor = $SourceColor
+    }
+
+    $OutputFile = Get-FullPathStrict -Path $OutputFile -ParamName 'OutputFile'
+    $LogFile    = Get-FullPathStrict -Path $LogFile    -ParamName 'LogFile'
 
     $srcRgb = Get-RgbBytesFromHash $SourceColor
     $tgtRgb = Get-RgbBytesFromHash $TargetColor
