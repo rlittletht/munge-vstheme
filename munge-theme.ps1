@@ -30,86 +30,98 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$InputFile,
 
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$OutputFile,
 
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$SourceColor,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [string]$TargetColor = $null,
     
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$LogFile        # path to append change logs
 )
 
 #region Utility: Parsing & Validation
 
-function Test-HexRgb {
+function Test-HexRgb
+{
     param([string]$Rgb)
     # Accept with or without leading '#'
     return ($Rgb -match '^#?[0-9A-Fa-f]{6}$')
 }
 
-function Get-RgbBytesFromHash {
+function Get-RgbBytesFromHash
+{
     param([string]$Rgb) # "#RRGGBB" or "RRGGBB"
-    if (-not (Test-HexRgb $Rgb)) {
+    if (-not (Test-HexRgb $Rgb))
+    {
         throw "Invalid RGB color '$Rgb'. Expected format: #RRGGBB (leading '#' optional)."
     }
     if ($Rgb.StartsWith('#')) { $Rgb = $Rgb.Substring(1) }
-    $rr = [Convert]::ToByte($Rgb.Substring(0,2),16)
-    $gg = [Convert]::ToByte($Rgb.Substring(2,2),16)
-    $bb = [Convert]::ToByte($Rgb.Substring(4,2),16)
-    [byte[]]@($rr,$gg,$bb)
+    $rr = [Convert]::ToByte($Rgb.Substring(0, 2), 16)
+    $gg = [Convert]::ToByte($Rgb.Substring(2, 2), 16)
+    $bb = [Convert]::ToByte($Rgb.Substring(4, 2), 16)
+    [byte[]]@($rr, $gg, $bb)
 }
 
-function Get-HashFromRgbBytes {
-    param([byte]$R,[byte]$G,[byte]$B)
-    return ('#{0:X2}{1:X2}{2:X2}' -f $R,$G,$B)
+function Get-HashFromRgbBytes
+{
+    param([byte]$R, [byte]$G, [byte]$B)
+    return ('#{0:X2}{1:X2}{2:X2}' -f $R, $G, $B)
 }
 
-function Split-ArgbHex8 {
+function Split-ArgbHex8
+{
     param([string]$ArgbHex8) # "AARRGGBB" (no '#')
-    if ($ArgbHex8 -notmatch '^[0-9A-Fa-f]{8}$') {
+    if ($ArgbHex8 -notmatch '^[0-9A-Fa-f]{8}$')
+    {
         throw "Invalid ARGB '$ArgbHex8'. Expected 8 hex chars (AARRGGBB)."
     }
-    $a = [Convert]::ToByte($ArgbHex8.Substring(0,2),16)
-    $r = [Convert]::ToByte($ArgbHex8.Substring(2,2),16)
-    $g = [Convert]::ToByte($ArgbHex8.Substring(4,2),16)
-    $b = [Convert]::ToByte($ArgbHex8.Substring(6,2),16)
-    [byte[]]@($a,$r,$g,$b)
+    $a = [Convert]::ToByte($ArgbHex8.Substring(0, 2), 16)
+    $r = [Convert]::ToByte($ArgbHex8.Substring(2, 2), 16)
+    $g = [Convert]::ToByte($ArgbHex8.Substring(4, 2), 16)
+    $b = [Convert]::ToByte($ArgbHex8.Substring(6, 2), 16)
+    [byte[]]@($a, $r, $g, $b)
 }
 
-function Join-ArgbHex8 {
-    param([byte]$A,[byte]$R,[byte]$G,[byte]$B)
-    return ('{0:X2}{1:X2}{2:X2}{3:X2}' -f $A,$R,$G,$B)
+function Join-ArgbHex8
+{
+    param([byte]$A, [byte]$R, [byte]$G, [byte]$B)
+    return ('{0:X2}{1:X2}{2:X2}{3:X2}' -f $A, $R, $G, $B)
 }
 
-function Ensure-ParentDirectory {
+function Ensure-ParentDirectory
+{
     param([string]$FilePath)
     if ([string]::IsNullOrWhiteSpace($FilePath)) { throw "Path cannot be empty." }
     $full = [System.IO.Path]::GetFullPath($FilePath)
     $parent = [System.IO.Path]::GetDirectoryName($full)
-    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+    if ($parent -and -not (Test-Path -LiteralPath $parent))
+    {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
     $full
 }
 
-function Get-FullPathStrict {
+function Get-FullPathStrict
+{
     param(
-        [Parameter(Mandatory=$true)][string]$Path,
-        [Parameter(Mandatory=$true)][string]$ParamName
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ParamName
     )
-    if ([string]::IsNullOrWhiteSpace($Path)) {
+    if ([string]::IsNullOrWhiteSpace($Path))
+    {
         throw "$ParamName cannot be empty."
     }
     # Must start with drive-root (C:\...) or UNC (\\server\share\...)
-    $isFullyQualified = $Path -match '^(?:[A-Za-z]:\\|\\\\)'
-    if (-not $isFullyQualified) {
+    $isFullyQualified = $Path -match '^(?:[A-Za-z]:[\\/]|\\\\|//)'
+    if (-not $isFullyQualified)
+    {
         throw "$ParamName must be a fully qualified path (e.g., C:\folder\file.ext or \\server\share\file.ext)."
     }
     return [System.IO.Path]::GetFullPath($Path)
@@ -119,19 +131,21 @@ function Get-FullPathStrict {
 
 #region Color math & selection
 
-function Get-EuclideanSq {
+function Get-EuclideanSq
+{
     param(
-        [byte]$R1,[byte]$G1,[byte]$B1,
-        [byte]$R2,[byte]$G2,[byte]$B2
+        [byte]$R1, [byte]$G1, [byte]$B1,
+        [byte]$R2, [byte]$G2, [byte]$B2
     )
     # squared distance in RGB space
     $dr = [int]$R1 - [int]$R2
     $dg = [int]$G1 - [int]$G2
     $db = [int]$B1 - [int]$B2
-    return ($dr*$dr + $dg*$dg + $db*$db)
+    return ($dr * $dr + $dg * $dg + $db * $db)
 }
 
-function Clamp-Byte {
+function Clamp-Byte
+{
     param([int]$x)
     if ($x -lt 0) { return [byte]0 }
     if ($x -gt 255) { return [byte]255 }
@@ -140,25 +154,30 @@ function Clamp-Byte {
 
 # Generates up to 26*radius candidates per radius step by stepping along axis and diagonal unit directions.
 # This gives a good approximation for "closest" in Euclidean space without exploring all 16M colors.
-function Find-ClosestUnusedColor {
+function Find-ClosestUnusedColor
+{
     param(
-        [byte]$TR,[byte]$TG,[byte]$TB,
+        [byte]$TR, [byte]$TG, [byte]$TB,
         [System.Collections.Generic.HashSet[string]]$UsedRgbSet # contains "rrggbb" lower-case
     )
 
-    $targetKey = ('{0:X2}{1:X2}{2:X2}' -f $TR,$TG,$TB).ToLowerInvariant()
-    if (-not $UsedRgbSet.Contains($targetKey)) {
+    $targetKey = ('{0:X2}{1:X2}{2:X2}' -f $TR, $TG, $TB).ToLowerInvariant()
+    if (-not $UsedRgbSet.Contains($targetKey))
+    {
         # Target is free — use it
-        return ,$TR, $TG, $TB
+        return , $TR, $TG, $TB
     }
 
     # Directions = all non-zero combinations of (-1,0,1) for R,G,B (26 directions)
     $dirs = @()
-    foreach ($dx in -1..1) {
-        foreach ($dy in -1..1) {
-            foreach ($dz in -1..1) {
+    foreach ($dx in -1..1)
+    {
+        foreach ($dy in -1..1)
+        {
+            foreach ($dz in -1..1)
+            {
                 if ($dx -eq 0 -and $dy -eq 0 -and $dz -eq 0) { continue }
-                $dirs += ,@($dx,$dy,$dz)
+                $dirs += , @($dx, $dy, $dz)
             }
         }
     }
@@ -166,26 +185,30 @@ function Find-ClosestUnusedColor {
     $best = $null
     $bestDist = [int]::MaxValue
 
-    for ($rad = 1; $rad -le 255; $rad++) {
-        foreach ($d in $dirs) {
+    for ($rad = 1; $rad -le 255; $rad++)
+    {
+        foreach ($d in $dirs)
+        {
             $rCand = Clamp-Byte([int]$TR + $rad * $d[0])
             $gCand = Clamp-Byte([int]$TG + $rad * $d[1])
             $bCand = Clamp-Byte([int]$TB + $rad * $d[2])
 
-            $key = ('{0:X2}{1:X2}{2:X2}' -f $rCand,$gCand,$bCand).ToLowerInvariant()
+            $key = ('{0:X2}{1:X2}{2:X2}' -f $rCand, $gCand, $bCand).ToLowerInvariant()
             if ($UsedRgbSet.Contains($key)) { continue }
 
             $dist = Get-EuclideanSq -R1 $rCand -G1 $gCand -B1 $bCand -R2 $TR -G2 $TG -B2 $TB
-            if ($dist -lt $bestDist) {
+            if ($dist -lt $bestDist)
+            {
                 $bestDist = $dist
-                $best = @([byte]$rCand,[byte]$gCand,[byte]$bCand)
+                $best = @([byte]$rCand, [byte]$gCand, [byte]$bCand)
                 if ($bestDist -eq 0) { break } # exact (shouldn't happen, already checked), but just in case
             }
         }
         if ($best) { break }
     }
 
-    if (-not $best) {
+    if (-not $best)
+    {
         throw "Failed to find an unused color (this is extremely unlikely)."
     }
 
@@ -210,87 +233,98 @@ function Find-ClosestUnusedColor {
 #  - supports single or double quotes
 $TagWithRawAndSourcePattern = '(?is)<(?<tag>Background|Foreground)\b(?=[^>]*\bType\s*=\s*["'']CT_RAW["''])(?=[^>]*\bSource\s*=\s*["''][0-9A-Fa-f]{8}["''])[^>]*?\bSource\s*=\s*(?<pre>["''])(?<hex>[0-9A-Fa-f]{8})(?<post>["''])'
 
-function Get-UsedRgbSetFromText {
+function Get-UsedRgbSetFromText
+{
     param([string]$XmlText)
 
     $set = New-Object 'System.Collections.Generic.HashSet[string]'
     $regex = [System.Text.RegularExpressions.Regex]::new($TagWithRawAndSourcePattern, 'IgnoreCase, Singleline')
 
-    foreach ($m in $regex.Matches($XmlText)) {
+    foreach ($m in $regex.Matches($XmlText))
+    {
         $hex = $m.Groups['hex'].Value  # AARRGGBB
-        $rgbKey = $hex.Substring(2,6).ToLowerInvariant()
+        $rgbKey = $hex.Substring(2, 6).ToLowerInvariant()
         [void]$set.Add($rgbKey)
     }
     $set
 }
 
-function Get-CategorySpansFromText {
+function Get-CategorySpansFromText
+{
     param([string]$XmlText)
 
     # Match each <Category ...>...</Category> block (non-greedy)
     $re = [System.Text.RegularExpressions.Regex]::new('(?is)<Category\b(?<attrs>[^>]*)>(?<content>.*?)</Category>')
     $spans = New-Object System.Collections.Generic.List[object]
 
-    foreach ($m in $re.Matches($XmlText)) {
+    foreach ($m in $re.Matches($XmlText))
+    {
         $attrs = $m.Groups['attrs'].Value
         $name = '(uncategorized)'
         $nm = [regex]::Match($attrs, '(?is)\bName\s*=\s*(["''])(?<n>.*?)\1')
         if ($nm.Success) { $name = $nm.Groups['n'].Value }
 
         $spans.Add([pscustomobject]@{
-            Start = $m.Index
-            End   = $m.Index + $m.Length  # exclusive
-            Name  = $name
-        }) | Out-Null
+                Start = $m.Index
+                End   = $m.Index + $m.Length  # exclusive
+                Name  = $name
+            }) | Out-Null
     }
     $spans
 }
 
-function Get-CategoryNameByIndex {
+function Get-CategoryNameByIndex
+{
     param(
         [int]$Index,
         [System.Collections.Generic.List[object]]$CategorySpans
     )
-    foreach ($s in $CategorySpans) {
+    foreach ($s in $CategorySpans)
+    {
         if ($Index -ge $s.Start -and $Index -lt $s.End) { return $s.Name }
     }
     return '(uncategorized)'
 }
 
-function Get-ColorSpansFromText {
+function Get-ColorSpansFromText
+{
     param([string]$XmlText)
 
     # Match each <Color ...>...</Color> block (non-greedy), regardless of attribute order
     $re = [System.Text.RegularExpressions.Regex]::new('(?is)<Color\b(?<attrs>[^>]*)>(?<content>.*?)</Color>')
     $spans = New-Object System.Collections.Generic.List[object]
 
-    foreach ($m in $re.Matches($XmlText)) {
+    foreach ($m in $re.Matches($XmlText))
+    {
         $attrs = $m.Groups['attrs'].Value
         $name = '(unnamed)'
         $nm = [regex]::Match($attrs, '(?is)\bName\s*=\s*(["''])(?<n>.*?)\1')
         if ($nm.Success) { $name = $nm.Groups['n'].Value }
 
         $spans.Add([pscustomobject]@{
-            Start = $m.Index
-            End   = $m.Index + $m.Length  # exclusive
-            Name  = $name
-        }) | Out-Null
+                Start = $m.Index
+                End   = $m.Index + $m.Length  # exclusive
+                Name  = $name
+            }) | Out-Null
     }
     $spans
 }
 
-function Get-UiElementNameByIndex {
+function Get-UiElementNameByIndex
+{
     param(
         [int]$Index,
         [System.Collections.Generic.List[object]]$ColorSpans
     )
-    foreach ($s in $ColorSpans) {
+    foreach ($s in $ColorSpans)
+    {
         if ($Index -ge $s.Start -and $Index -lt $s.End) { return $s.Name }
     }
     return '(unnamed)'
 }
 
-function Replace-MatchingSourcesInText {
+function Replace-MatchingSourcesInText
+{
     param(
         [string]$XmlText,
         [byte[]]$SourceRgb,  # [R,G,B]
@@ -306,46 +340,47 @@ function Replace-MatchingSourcesInText {
     $re = [System.Text.RegularExpressions.Regex]::new($TagWithRawAndSourcePattern, 'IgnoreCase, Singleline')
 
     # Capture needed values locally for the delegate (no $using:)
-    $srcKey  = ('{0:X2}{1:X2}{2:X2}' -f $SourceRgb[0],$SourceRgb[1],$SourceRgb[2]).ToLowerInvariant()
-    $tR      = [byte]$TargetRgb[0]
-    $tG      = [byte]$TargetRgb[1]
-    $tB      = [byte]$TargetRgb[2]
+    $srcKey = ('{0:X2}{1:X2}{2:X2}' -f $SourceRgb[0], $SourceRgb[1], $SourceRgb[2]).ToLowerInvariant()
+    $tR = [byte]$TargetRgb[0]
+    $tG = [byte]$TargetRgb[1]
+    $tB = [byte]$TargetRgb[2]
     $usedSet = $UsedRgbSet
-    $logBuf  = $LogBuffer
-    $spans   = $ColorSpans
+    $logBuf = $LogBuffer
+    $spans = $ColorSpans
     $catSpans = $CategorySpans
     
-    $evaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+    $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
         param([System.Text.RegularExpressions.Match]$m)
 
         $aarrggbb = $m.Groups['hex'].Value
-        $a = [Convert]::ToByte($aarrggbb.Substring(0,2),16)
-        $r = [Convert]::ToByte($aarrggbb.Substring(2,2),16)
-        $g = [Convert]::ToByte($aarrggbb.Substring(4,2),16)
-        $b = [Convert]::ToByte($aarrggbb.Substring(6,2),16)
+        $a = [Convert]::ToByte($aarrggbb.Substring(0, 2), 16)
+        $r = [Convert]::ToByte($aarrggbb.Substring(2, 2), 16)
+        $g = [Convert]::ToByte($aarrggbb.Substring(4, 2), 16)
+        $b = [Convert]::ToByte($aarrggbb.Substring(6, 2), 16)
 
-        $rgbKeyHere = ('{0:X2}{1:X2}{2:X2}' -f $r,$g,$b).ToLowerInvariant()
-        if ($rgbKeyHere -ne $srcKey) {
+        $rgbKeyHere = ('{0:X2}{1:X2}{2:X2}' -f $r, $g, $b).ToLowerInvariant()
+        if ($rgbKeyHere -ne $srcKey)
+        {
             return $m.Value
         }
 
         # Choose closest unused to target, then reserve it
         $best = Find-ClosestUnusedColor -TR $tR -TG $tG -TB $tB -UsedRgbSet $usedSet
-        $newR=[byte]$best[0]; $newG=[byte]$best[1]; $newB=[byte]$best[2]
-        $newKey = ('{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB).ToLowerInvariant()
+        $newR = [byte]$best[0]; $newG = [byte]$best[1]; $newB = [byte]$best[2]
+        $newKey = ('{0:X2}{1:X2}{2:X2}' -f $newR, $newG, $newB).ToLowerInvariant()
         [void]$usedSet.Add($newKey)
 
         $newHex = Join-ArgbHex8 -A $a -R $newR -G $newG -B $newB
 
         # Look up parent <Color Name="..."> by this match's original offset
-        $uiName  = Get-UiElementNameByIndex -Index $m.Index -ColorSpans $spans
-        $catName  = Get-CategoryNameByIndex -Index $m.Index -CategorySpans $catSpans
+        $uiName = Get-UiElementNameByIndex -Index $m.Index -ColorSpans $spans
+        $catName = Get-CategoryNameByIndex -Index $m.Index -CategorySpans $catSpans
         $tagName = $m.Groups['tag'].Value  # Background/Foreground
 
         # Log line: category,ui name,original color,new color
-        $origRgbHash = ('#{0:X2}{1:X2}{2:X2}' -f $r,$g,$b)
-        $newRgbHash  = ('#{0:X2}{1:X2}{2:X2}' -f $newR,$newG,$newB)
-        $logLine = "{0},{1},{2},{3}" -f $catName, $uiName, $origRgbHash, $newRgbHash
+        $origRgbHash = ('#{0:X2}{1:X2}{2:X2}' -f $r, $g, $b)
+        $newRgbHash = ('#{0:X2}{1:X2}{2:X2}' -f $newR, $newG, $newB)
+        $logLine = "{0},{1},{2},{3}" -f $catName, $uiName, $origRgbHash, $newFRgbHash
         $logBuf.Add($logLine) | Out-Null
 
         $script:__replcount = $script:__replcount + 1
@@ -365,32 +400,35 @@ function Replace-MatchingSourcesInText {
 
 #region Main
 
-try {
-    if (-not (Test-Path -LiteralPath $InputFile)) {
+try
+{
+    if (-not (Test-Path -LiteralPath $InputFile))
+    {
         throw "Input file not found: $InputFile"
     }
 
     # If -TargetColor wasn’t provided (or is empty), use -SourceColor
-    if (-not $PSBoundParameters.ContainsKey('TargetColor') -or [string]::IsNullOrWhiteSpace($TargetColor)) {
+    if (-not $PSBoundParameters.ContainsKey('TargetColor') -or [string]::IsNullOrWhiteSpace($TargetColor))
+    {
         $TargetColor = $SourceColor
     }
 
     $OutputFile = Get-FullPathStrict -Path $OutputFile -ParamName 'OutputFile'
-    $LogFile    = Get-FullPathStrict -Path $LogFile    -ParamName 'LogFile'
+    $LogFile = Get-FullPathStrict -Path $LogFile    -ParamName 'LogFile'
 
     $srcRgb = Get-RgbBytesFromHash $SourceColor
     $tgtRgb = Get-RgbBytesFromHash $TargetColor
 
-#    [xml]$xml = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
+    #    [xml]$xml = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
     $text = Get-Content -LiteralPath $InputFile -Raw -ErrorAction Stop
     $colorSpans = Get-ColorSpansFromText -XmlText $text
     $categorySpans = Get-CategorySpansFromText -XmlText $text
 
     # Collect relevant elements
-#    $elements = [System.Collections.ArrayList](Get-ThemeElements -XmlDoc $xml)
+    #    $elements = [System.Collections.ArrayList](Get-ThemeElements -XmlDoc $xml)
 
     # Build initial used set from CT_RAW nodes (original colors only)
-#    $used = Build-UsedColorSet -Elements $elements
+    #    $used = Build-UsedColorSet -Elements $elements
     $used = Get-UsedRgbSetFromText -XmlText $text
 
     # Replace matching colors; as we replace, add the new RGBs to the used set to ensure uniqueness
@@ -407,25 +445,27 @@ try {
         -ColorSpans $colorSpans `
         -CategorySpans $categorySpans
 
-#    $count = Replace-MatchingColors -Elements $elements -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used
+    #    $count = Replace-MatchingColors -Elements $elements -SourceRgb $srcRgb -TargetRgb $tgtRgb -UsedRgbSet $used
 
     $outPath = Ensure-ParentDirectory -FilePath $OutputFile
 
-#    $xml.Save($OutputFile)
+    #    $xml.Save($OutputFile)
     # Write back, preserving encoding if possible (default is UTF8 without BOM; adjust if you need BOM)
-#    $outPath = Ensure-ParentDirectory -FilePath $OutputFile
+    #    $outPath = Ensure-ParentDirectory -FilePath $OutputFile
     Set-Content -LiteralPath $outPath -Value $updated -Encoding UTF8
 
     # Write / append logs
     $logPath = Ensure-ParentDirectory -FilePath $LogFile
-    if ($logBuffer.Count -gt 0) {
+    if ($logBuffer.Count -gt 0)
+    {
         # append lines (create file if it doesn't exist)
         Add-Content -LiteralPath $logPath -Value $logBuffer -Encoding UTF8
     }
 
-    Write-Host ("Done. Replaced {0} occurrence(s) of {1} with colors based on {2}. Output: {3}" -f $countRef,$SourceColor,$TargetColor,$OutputFile)
+    Write-Host ("Done. Replaced {0} occurrence(s) of {1} with colors based on {2}. Output: {3}" -f $countRef, $SourceColor, $TargetColor, $OutputFile)
 }
-catch {
+catch
+{
     Write-Error $_.Exception.Message
     exit 1
 }
