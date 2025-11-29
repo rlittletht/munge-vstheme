@@ -85,6 +85,10 @@ function Get-OrCreateCategory {
         $category = $XmlDoc.CreateElement("Category")
         $category.SetAttribute("Name", $CategoryName)
         $category.SetAttribute("GUID", $CategoryGuid)
+        
+        # Add proper indentation before the category
+        $indent = $XmlDoc.CreateTextNode("`r`n    ")
+        [void]$ThemeNode.AppendChild($indent)
         [void]$ThemeNode.AppendChild($category)
     }
     
@@ -104,17 +108,20 @@ function Merge-ColorNode {
     # Find existing color node
     $existingColor = $CategoryNode.SelectSingleNode("Color[@Name='$colorName']")
     
+    # Import the new color node first
+    $importedNode = $XmlDoc.ImportNode($SourceColorNode, $true)
+    
     if ($existingColor) {
         Write-Host "    Updating color: $colorName"
-        # Remove the old node
-        [void]$CategoryNode.RemoveChild($existingColor)
+        # Replace the existing node with the new one
+        [void]$CategoryNode.ReplaceChild($importedNode, $existingColor)
     } else {
         Write-Host "    Adding new color: $colorName"
+        # Add proper indentation before the color node
+        $indent = $XmlDoc.CreateTextNode("`r`n      ")
+        [void]$CategoryNode.AppendChild($indent)
+        [void]$CategoryNode.AppendChild($importedNode)
     }
-    
-    # Import and append the new color node
-    $importedNode = $XmlDoc.ImportNode($SourceColorNode, $true)
-    [void]$CategoryNode.AppendChild($importedNode)
 }
 
 # Get the Theme node from the theme file
@@ -125,11 +132,18 @@ if (-not $themeNode) {
     exit 1
 }
 
+# Find categories in the changes file - try multiple possible XPath expressions
+$changeCategories = $changesXml.SelectNodes("//Category")
+if ($changeCategories.Count -eq 0) {
+    Write-Error "Could not find any Category nodes in changes file"
+    exit 1
+}
+
 # Process each category in the changes file
 $categoriesProcessed = 0
 $colorsProcessed = 0
 
-foreach ($changeCategory in $changesXml.SelectNodes("//Category")) {
+foreach ($changeCategory in $changeCategories) {
     $categoryName = $changeCategory.GetAttribute("Name")
     $categoryGuid = $changeCategory.GetAttribute("GUID")
     
@@ -144,7 +158,15 @@ foreach ($changeCategory in $changesXml.SelectNodes("//Category")) {
         Merge-ColorNode -XmlDoc $themeXml -CategoryNode $targetCategory -SourceColorNode $colorNode
         $colorsProcessed++
     }
+    
+    # Add closing newline for the category
+    $closingIndent = $themeXml.CreateTextNode("`r`n    ")
+    [void]$targetCategory.AppendChild($closingIndent)
 }
+
+# Add final closing newline for the theme
+$finalIndent = $themeXml.CreateTextNode("`r`n  ")
+[void]$themeNode.AppendChild($finalIndent)
 
 # Save the merged XML with proper settings to preserve entities
 $settings = New-Object System.Xml.XmlWriterSettings
